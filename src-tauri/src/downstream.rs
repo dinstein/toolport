@@ -50,6 +50,17 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// or broken server can't stream gigabytes to exhaust gateway memory. Generous: real
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Cap on the legacy HTTP+SSE handshake: how many stream bytes we scan for the
+/// `endpoint` event before giving up on the server as a legacy SSE speaker.
+const LEGACY_SSE_HANDSHAKE_BYTES: u64 = 64 * 1024;
+/// How long a legacy-SSE request waits for its response frame on the long-lived
+/// GET stream. Matches the Streamable HTTP agent's overall request timeout so the
+/// two transports fail a hung call on the same clock.
+const LEGACY_SSE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-read timeout on the legacy SSE stream: slightly above the response
+/// deadline so an idle wait is normally ended by the deadline check (which can
+/// distinguish "no response yet" from "socket dead"), not the socket timeout.
+const LEGACY_SSE_READ_TIMEOUT: Duration = Duration::from_secs(35);
 /// Bound paginated MCP catalog traversal so a malicious server cannot keep the
 /// gateway in an infinite cursor chain or grow its in-memory catalog without limit.
 const MAX_LIST_PAGES: usize = 1_000;
@@ -1909,13 +1920,9 @@ fn screen_resolved_addrs(
 /// has. `block_private` extends the screen to internal addresses for untrusted inputs.
 /// Redirects stay disabled so a credential-bearing request cannot be replayed to a
 /// different host. Callers choose a timeout appropriate for their operation.
-pub(crate) fn guarded_agent_with_timeout(
-    block_private: bool,
-    timeout: std::time::Duration,
-) -> ureq::Agent {
+fn guarded_builder(block_private: bool) -> ureq::AgentBuilder {
     use std::net::{SocketAddr, ToSocketAddrs};
     ureq::AgentBuilder::new()
-        .timeout(timeout)
         // Never follow redirects. MCP Streamable HTTP doesn't need cross-host
         // redirects, and following one would let a malicious server bounce us to an
         // internal address (SSRF, e.g. cloud metadata) or replay our Authorization
@@ -1926,6 +1933,23 @@ pub(crate) fn guarded_agent_with_timeout(
             screen_resolved_addrs(&addrs, block_private)?;
             Ok(addrs)
         })
+}
+
+pub(crate) fn guarded_agent_with_timeout(
+    block_private: bool,
+    timeout: std::time::Duration,
+) -> ureq::Agent {
+    guarded_builder(block_private).timeout(timeout).build()
+}
+
+/// Agent for the legacy HTTP+SSE long-lived GET stream: same SSRF resolver and
+/// no-redirect policy, but NO overall request timeout - the stream lives for the
+/// whole session. Reads are bounded per-read instead so a dead socket still
+/// surfaces as an error rather than blocking forever.
+fn guarded_stream_agent(block_private: bool) -> ureq::Agent {
+    guarded_builder(block_private)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(LEGACY_SSE_READ_TIMEOUT)
         .build()
 }
 
@@ -1935,9 +1959,49 @@ fn guarded_agent(block_private: bool) -> ureq::Agent {
     guarded_agent_with_timeout(block_private, std::time::Duration::from_secs(30))
 }
 
+/// State of a live legacy HTTP+SSE (protocol 2024-11-05) session: the message
+/// endpoint announced by the server's `endpoint` event, and the long-lived GET
+/// stream that carries every response back.
+struct LegacySse {
+    /// Absolute, same-origin URL to POST JSON-RPC messages to.
+    endpoint: String,
+    /// The open `text/event-stream` body from the initial GET.
+    reader: BufReader<Box<dyn Read + Send>>,
+}
+
+/// Resolve the (possibly relative) endpoint URL from a legacy SSE `endpoint`
+/// event against the stream's base URL, refusing anything that isn't
+/// same-origin: the endpoint gets our Authorization bearer on every message, so
+/// a cross-origin endpoint would let a malicious stream exfiltrate the token
+/// (the same reason redirects are disabled on the agents).
+fn resolve_sse_endpoint(base: &str, raw: &str) -> Result<String, String> {
+    let base_url =
+        url::Url::parse(base).map_err(|e| format!("invalid base URL {base}: {e}"))?;
+    let endpoint = base_url
+        .join(raw.trim())
+        .map_err(|e| format!("server sent an invalid endpoint URL {raw:?}: {e}"))?;
+    if endpoint.scheme() != base_url.scheme()
+        || endpoint.host_str() != base_url.host_str()
+        || endpoint.port_or_known_default() != base_url.port_or_known_default()
+    {
+        return Err(format!(
+            "server sent a cross-origin endpoint {endpoint} (stream origin {base}); \
+             refusing to send credentials there"
+        ));
+    }
+    Ok(endpoint.to_string())
+}
+
 /// Talks to a remote MCP server over the Streamable HTTP transport: each request
 /// is a POST, and the response is either a JSON body or an SSE stream carrying
 /// the JSON-RPC message. A session id from `initialize` is echoed on later calls.
+///
+/// Backwards compatibility: when the FIRST request's POST is refused with a
+/// 400/404/405, the transport probes the URL as a legacy HTTP+SSE (2024-11-05)
+/// server - GET opens a long-lived event stream, the server announces a message
+/// endpoint, requests are POSTed there and responses read off the stream. Old
+/// SSE-only servers (a `/sse` route that only accepts GET) connect transparently
+/// this way instead of failing with "HTTP 405".
 pub struct HttpTransport {
     url: String,
     agent: ureq::Agent,
@@ -1956,6 +2020,20 @@ pub struct HttpTransport {
     /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
     /// upstream clients (SOU-394 follow-up for remote downstreams).
     resource_updated: Option<ResourceUpdatedSink>,
+    /// Remembered so the legacy stream agent (built lazily on fallback) applies
+    /// the same SSRF policy as the POST agents.
+    block_private: bool,
+    /// True once the legacy HTTP+SSE fallback has engaged; the transport then
+    /// stays on the legacy path for its whole life (the server already refused
+    /// Streamable HTTP once), reopening the stream below whenever it dies.
+    legacy_mode: bool,
+    /// The LIVE legacy session, when one is open. `None` while in `legacy_mode`
+    /// means the stream died and the next request reopens it.
+    legacy: Option<LegacySse>,
+    /// The fallback probe runs at most once per transport, and only before any
+    /// Streamable HTTP POST has succeeded.
+    legacy_probed: bool,
+    streamable_ok: bool,
 }
 
 impl HttpTransport {
@@ -2000,6 +2078,11 @@ impl HttpTransport {
             refresh,
             server_handler: None,
             resource_updated: None,
+            block_private,
+            legacy_mode: false,
+            legacy: None,
+            legacy_probed: false,
+            streamable_ok: false,
         }
     }
 
@@ -2057,14 +2140,25 @@ impl HttpTransport {
     }
 
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
+    /// In legacy HTTP+SSE mode the message goes to the announced endpoint.
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
+        let target = match &self.legacy {
+            Some(l) => l.endpoint.clone(),
+            None => self.url.clone(),
+        };
+        self.post_no_response_to(&target, body)
+    }
+
+    /// POST JSON-RPC to `target` without waiting for a response body. Uses the
+    /// inline agent so it can run while an SSE body is open on the main agent.
+    fn post_no_response_to(&mut self, target: &str, body: &Value) -> Result<(), TransportError> {
         let payload = body.to_string();
         self.refresh_before_send();
         let mut refreshed = false;
         let resp = loop {
             let mut req = self
                 .inline_agent
-                .post(&self.url)
+                .post(target)
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", PROTOCOL_VERSION);
@@ -2153,6 +2247,11 @@ impl HttpTransport {
     }
 
     fn post(&mut self, body: &Value, expect_response: bool) -> Result<Option<Value>, TransportError> {
+        // A transport that fell back to legacy HTTP+SSE stays there: the server
+        // already refused Streamable HTTP once.
+        if self.legacy_mode {
+            return self.legacy_post(body, expect_response);
+        }
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -2203,6 +2302,25 @@ impl HttpTransport {
                 }
                 Err(ureq::Error::Status(code, r)) => {
                     let detail: String = read_capped(r, 64 * 1024).chars().take(200).collect();
+                    // Backwards compatibility (MCP 2025-03-26 §backwards-compat):
+                    // a 4xx on the FIRST POST is how a legacy HTTP+SSE server
+                    // (GET-only /sse route) refuses Streamable HTTP. Probe the
+                    // old transport once before surfacing the error.
+                    if matches!(code, 400 | 404 | 405)
+                        && !self.streamable_ok
+                        && !self.legacy_probed
+                    {
+                        self.legacy_probed = true;
+                        match self.open_legacy_stream() {
+                            Ok(()) => return self.legacy_post(body, expect_response),
+                            Err(probe) => {
+                                return Err(TransportError::Fatal(format!(
+                                    "HTTP {code}: {detail} (also tried the legacy \
+                                     HTTP+SSE transport: {probe})"
+                                )))
+                            }
+                        }
+                    }
                     let hint = if code == 401 || code == 403 {
                         " (needs authentication)"
                     } else {
@@ -2222,6 +2340,7 @@ impl HttpTransport {
             }
         };
 
+        self.streamable_ok = true;
         if let Some(sid) = resp.header("Mcp-Session-Id") {
             self.session_id = Some(sid.to_string());
         }
@@ -2243,6 +2362,194 @@ impl HttpTransport {
         serde_json::from_str(&text)
             .map(Some)
             .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))
+    }
+
+    /// Open the legacy HTTP+SSE session: GET the base URL as an event stream and
+    /// scan it for the `endpoint` event announcing where to POST messages.
+    /// On success `self.legacy` holds the endpoint and the live stream.
+    fn open_legacy_stream(&mut self) -> Result<(), String> {
+        // A mid-session reopen can happen long after connect; make sure the GET
+        // doesn't fail on an expired token when a refresh callback is available.
+        self.refresh_before_send();
+        let agent = guarded_stream_agent(self.block_private);
+        let mut req = agent
+            .get(&self.url)
+            .set("Accept", "text/event-stream")
+            .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+        if let Some(token) = &self.auth {
+            req = req.set("Authorization", &bearer_header(token));
+        }
+        let resp = req.call().map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let detail: String = read_capped(r, 8 * 1024).chars().take(200).collect();
+                let hint = if code == 401 || code == 403 {
+                    " (needs authentication)"
+                } else {
+                    ""
+                };
+                format!("SSE GET returned HTTP {code}{hint}: {detail}")
+            }
+            e => format!("SSE GET failed: {e}"),
+        })?;
+        let is_sse = resp
+            .header("content-type")
+            .map(|c| c.to_lowercase().contains("text/event-stream"))
+            .unwrap_or(false);
+        if !is_sse {
+            return Err(format!(
+                "SSE GET returned {} instead of text/event-stream",
+                resp.header("content-type").unwrap_or("no content-type")
+            ));
+        }
+        let mut reader: BufReader<Box<dyn Read + Send>> =
+            BufReader::new(Box::new(resp.into_reader()));
+        let mut line = String::new();
+        let mut bytes_read: u64 = 0;
+        let mut current_event = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| format!("SSE stream read failed before the endpoint event: {e}"))?;
+            if n == 0 {
+                return Err("SSE stream closed before announcing an endpoint".to_string());
+            }
+            bytes_read += n as u64;
+            if bytes_read > LEGACY_SSE_HANDSHAKE_BYTES {
+                return Err(format!(
+                    "no endpoint event within the first {LEGACY_SSE_HANDSHAKE_BYTES} stream bytes"
+                ));
+            }
+            let trimmed = line.trim();
+            if let Some(name) = trimmed.strip_prefix("event:") {
+                current_event = name.trim().to_string();
+                continue;
+            }
+            if let Some(data) = trimmed.strip_prefix("data:") {
+                if current_event == "endpoint" {
+                    let endpoint = resolve_sse_endpoint(&self.url, data)?;
+                    self.legacy = Some(LegacySse { endpoint, reader });
+                    self.legacy_mode = true;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// One request/notify over the legacy transport: POST the message to the
+    /// announced endpoint (the server replies 202 with no meaningful body), then
+    /// for requests read the long-lived stream until the matching response frame
+    /// arrives. A dead stream is reopened once before the call.
+    fn legacy_post(
+        &mut self,
+        body: &Value,
+        expect_response: bool,
+    ) -> Result<Option<Value>, TransportError> {
+        if self.legacy.is_none() {
+            // The stream died mid-session (previous wait errored). Reopen so a
+            // transient network blip heals like a Streamable HTTP reconnect would.
+            self.open_legacy_stream().map_err(TransportError::Unavailable)?;
+        }
+        let endpoint = self
+            .legacy
+            .as_ref()
+            .expect("legacy stream just opened")
+            .endpoint
+            .clone();
+        if let Err(e) = self.post_no_response_to(&endpoint, body) {
+            // A refused endpoint POST usually means the session died with the
+            // server (restart invalidated the sessionId baked into the endpoint).
+            // Drop the stream and report Unavailable so the router's reconnect
+            // path builds a fresh session instead of hammering a dead endpoint
+            // with Fatal errors forever. Auth failures keep their message (the
+            // connect-time refresh-and-retry keys off it).
+            self.legacy = None;
+            return Err(match e {
+                TransportError::Fatal(msg) if !msg.contains("needs authentication") => {
+                    TransportError::Unavailable(format!("legacy SSE endpoint POST failed: {msg}"))
+                }
+                other => other,
+            });
+        }
+        if !expect_response {
+            return Ok(None);
+        }
+        let wanted = body.get("id").cloned();
+        // Take the stream out so inline replies (which need &mut self to POST)
+        // can run while we hold the reader; restored only on success - any wait
+        // error leaves the stream considered dead and reopened next call.
+        let mut stream = self.legacy.take().expect("legacy stream present");
+        let result = self.read_legacy_response(&mut stream, wanted.as_ref());
+        if result.is_ok() {
+            self.legacy = Some(stream);
+        }
+        result
+    }
+
+    /// Read the legacy stream until the response frame whose id matches `wanted`,
+    /// answering server-initiated requests and fanning resource updates on the
+    /// way, exactly like `read_sse_response` does for a Streamable HTTP body.
+    fn read_legacy_response(
+        &mut self,
+        stream: &mut LegacySse,
+        wanted: Option<&Value>,
+    ) -> Result<Option<Value>, TransportError> {
+        let deadline = Instant::now() + LEGACY_SSE_RESPONSE_TIMEOUT;
+        let mut line = String::new();
+        let mut bytes_read: u64 = 0;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(TransportError::Unavailable(
+                    "timed out waiting for a response on the legacy SSE stream".to_string(),
+                ));
+            }
+            line.clear();
+            let n = stream
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| {
+                    TransportError::Unavailable(format!("legacy SSE stream read failed: {e}"))
+                })?;
+            if n == 0 {
+                return Err(TransportError::Unavailable(
+                    "legacy SSE stream closed while waiting for a response".to_string(),
+                ));
+            }
+            bytes_read += n as u64;
+            if bytes_read > MAX_RESPONSE_BYTES {
+                return Err(TransportError::Fatal(format!(
+                    "SSE response exceeded {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+            let trimmed = line.trim_start();
+            let Some(data) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(sink) = &self.resource_updated {
+                if let Some(uri) = resource_updated_uri(data) {
+                    sink(uri);
+                    continue;
+                }
+            }
+            if is_server_initiated_request(&v) {
+                if let Some(handler) = self.server_handler.clone() {
+                    if let Some(resp) = handler(&v) {
+                        self.post_no_response_to(&stream.endpoint, &resp)?;
+                    }
+                }
+                continue;
+            }
+            if ids_match(v.get("id"), wanted) {
+                return Ok(Some(v));
+            }
+        }
     }
 }
 
@@ -3422,6 +3729,330 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn resolve_sse_endpoint_joins_and_enforces_same_origin() {
+        use super::resolve_sse_endpoint;
+        // Root-relative and absolute same-origin endpoints resolve.
+        assert_eq!(
+            resolve_sse_endpoint("http://127.0.0.1:9000/sse", "/messages?sessionId=abc").unwrap(),
+            "http://127.0.0.1:9000/messages?sessionId=abc"
+        );
+        assert_eq!(
+            resolve_sse_endpoint(
+                "https://example.com/sse",
+                "https://example.com/messages"
+            )
+            .unwrap(),
+            "https://example.com/messages"
+        );
+        // Path-relative resolves against the stream URL's directory.
+        assert_eq!(
+            resolve_sse_endpoint("http://127.0.0.1:9000/mcp/sse", "messages").unwrap(),
+            "http://127.0.0.1:9000/mcp/messages"
+        );
+        // Cross-origin (host, port, or scheme) is refused: the endpoint receives
+        // our bearer token on every message.
+        assert!(resolve_sse_endpoint("https://example.com/sse", "https://evil.com/m").is_err());
+        assert!(
+            resolve_sse_endpoint("http://127.0.0.1:9000/sse", "http://127.0.0.1:9001/m").is_err()
+        );
+        assert!(resolve_sse_endpoint("https://example.com/sse", "http://example.com/m").is_err());
+        // Default ports are equivalent to explicit ones.
+        assert!(resolve_sse_endpoint("https://example.com/sse", "https://example.com:443/m").is_ok());
+    }
+
+    /// A legacy HTTP+SSE (2024-11-05) server: POST to the base URL is refused
+    /// with 405, GET opens an event stream that announces `/messages` as the
+    /// endpoint, requests POSTed there are answered with 202 and the response
+    /// arrives as a frame on the stream. The transport must fall back
+    /// transparently and keep using the stream for later requests.
+    #[test]
+    fn http_falls_back_to_legacy_sse_on_405() {
+        use super::{HttpTransport, Transport};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = std::thread::spawn(move || {
+            fn read_http_headers(r: &mut impl Read) -> Vec<u8> {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while r.read(&mut byte).unwrap() > 0 {
+                    buf.push(byte[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                buf
+            }
+            fn content_length(headers: &[u8]) -> Option<usize> {
+                for line in String::from_utf8_lossy(headers).lines() {
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        return v.trim().parse().ok();
+                    }
+                }
+                None
+            }
+            fn drain_body(conn: &mut (impl Read + Write), headers: &[u8]) -> String {
+                if String::from_utf8_lossy(headers)
+                    .to_ascii_lowercase()
+                    .contains("expect: 100-continue")
+                {
+                    conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+                }
+                match content_length(headers) {
+                    Some(len) => {
+                        let mut raw = vec![0u8; len];
+                        conn.read_exact(&mut raw).unwrap();
+                        String::from_utf8_lossy(&raw).into_owned()
+                    }
+                    None => String::new(),
+                }
+            }
+            fn write_chunk(w: &mut impl Write, data: &[u8]) {
+                write!(w, "{:x}\r\n", data.len()).unwrap();
+                w.write_all(data).unwrap();
+                w.write_all(b"\r\n").unwrap();
+                w.flush().unwrap();
+            }
+
+            // 1: POST initialize -> 405 (legacy servers only accept GET here).
+            let mut c1 = listener.accept().unwrap().0;
+            let h1 = read_http_headers(&mut c1);
+            assert!(h1.starts_with(b"POST"));
+            drain_body(&mut c1, &h1);
+            c1.write_all(
+                b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+
+            // 2: GET -> event stream announcing the message endpoint.
+            let mut sse = listener.accept().unwrap().0;
+            let h2 = read_http_headers(&mut sse);
+            assert!(h2.starts_with(b"GET"));
+            assert!(String::from_utf8_lossy(&h2)
+                .to_ascii_lowercase()
+                .contains("authorization: bearer tok"));
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            write_chunk(
+                &mut sse,
+                b": keepalive comment\nevent: endpoint\ndata: /messages?sessionId=s1\n\n",
+            );
+
+            // 3: the original initialize POSTed to the endpoint -> 202, response
+            // frame goes out on the stream.
+            let mut c3 = listener.accept().unwrap().0;
+            let h3 = read_http_headers(&mut c3);
+            assert!(String::from_utf8_lossy(&h3).contains("/messages?sessionId=s1"));
+            let body3 = drain_body(&mut c3, &h3);
+            assert!(body3.contains("\"id\":1"));
+            c3.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            write_chunk(
+                &mut sse,
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}\n\n",
+            );
+
+            // 4: a second request goes straight to the endpoint (no re-probe)
+            // and is answered on the same stream.
+            let mut c4 = listener.accept().unwrap().0;
+            let h4 = read_http_headers(&mut c4);
+            assert!(String::from_utf8_lossy(&h4).contains("/messages?sessionId=s1"));
+            let body4 = drain_body(&mut c4, &h4);
+            assert!(body4.contains("\"id\":2"));
+            c4.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            write_chunk(
+                &mut sse,
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+            );
+            sse.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/sse");
+        let mut t = HttpTransport::with_auth(&url, Some("tok".to_string()));
+        let init = t.request("initialize", json!({})).expect("fallback connect");
+        assert_eq!(init, json!({"capabilities": {}}));
+        let tools = t.request("tools/list", json!({})).expect("second call on stream");
+        assert_eq!(tools, json!({"tools": []}));
+        server_handle.join().unwrap();
+    }
+
+    /// A dead legacy stream self-heals: the request that hits the dead stream
+    /// surfaces Unavailable (so the router can back off / reconnect), and the
+    /// NEXT request transparently reopens a fresh GET stream + endpoint instead
+    /// of retrying Streamable HTTP (which the server already refused) or
+    /// hammering the stale endpoint.
+    #[test]
+    fn legacy_sse_reopens_stream_after_it_dies() {
+        use super::{HttpTransport, Transport, TransportError};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = std::thread::spawn(move || {
+            fn read_http_headers(r: &mut impl Read) -> Vec<u8> {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while r.read(&mut byte).unwrap() > 0 {
+                    buf.push(byte[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                buf
+            }
+            fn drain_body(conn: &mut (impl Read + Write), headers: &[u8]) {
+                let text = String::from_utf8_lossy(headers).to_ascii_lowercase();
+                if text.contains("expect: 100-continue") {
+                    conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+                }
+                if let Some(len) = text.lines().find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                }) {
+                    let mut raw = vec![0u8; len];
+                    conn.read_exact(&mut raw).unwrap();
+                }
+            }
+            fn write_chunk(w: &mut impl Write, data: &[u8]) {
+                write!(w, "{:x}\r\n", data.len()).unwrap();
+                w.write_all(data).unwrap();
+                w.write_all(b"\r\n").unwrap();
+                w.flush().unwrap();
+            }
+            fn accept_202(listener: &TcpListener) {
+                let mut c = listener.accept().unwrap().0;
+                let h = read_http_headers(&mut c);
+                drain_body(&mut c, &h);
+                c.write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            }
+
+            // POST -> 405, GET -> stream #1.
+            let mut c1 = listener.accept().unwrap().0;
+            let h1 = read_http_headers(&mut c1);
+            drain_body(&mut c1, &h1);
+            c1.write_all(
+                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut sse1 = listener.accept().unwrap().0;
+            read_http_headers(&mut sse1);
+            sse1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            write_chunk(&mut sse1, b"event: endpoint\ndata: /messages?session=1\n\n");
+            accept_202(&listener); // request 1 reaches endpoint #1
+            write_chunk(
+                &mut sse1,
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"n\":1}}\n\n",
+            );
+            // Kill stream #1: request 2's POST is accepted but the stream closes
+            // before any response frame arrives.
+            accept_202(&listener);
+            sse1.write_all(b"0\r\n\r\n").unwrap();
+            drop(sse1);
+
+            // Request 3 must arrive as a fresh GET (stream #2), not a POST.
+            let mut sse2 = listener.accept().unwrap().0;
+            let h = read_http_headers(&mut sse2);
+            assert!(h.starts_with(b"GET"), "expected reopen GET, got {:?}", String::from_utf8_lossy(&h[..4.min(h.len())]));
+            sse2.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            write_chunk(&mut sse2, b"event: endpoint\ndata: /messages?session=2\n\n");
+            let mut c = listener.accept().unwrap().0;
+            let h = read_http_headers(&mut c);
+            assert!(String::from_utf8_lossy(&h).contains("session=2"));
+            drain_body(&mut c, &h);
+            c.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            write_chunk(
+                &mut sse2,
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"n\":3}}\n\n",
+            );
+            sse2.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/sse");
+        let mut t = HttpTransport::new(&url);
+        assert_eq!(t.request("a", json!({})).unwrap(), json!({"n": 1}));
+        match t.request("b", json!({})) {
+            Err(TransportError::Unavailable(_)) => {}
+            other => panic!("expected Unavailable on dead stream, got {other:?}"),
+        }
+        assert_eq!(t.request("c", json!({})).unwrap(), json!({"n": 3}));
+        server_handle.join().unwrap();
+    }
+
+    /// When the POST is refused but the URL isn't a legacy SSE server either,
+    /// the surfaced error carries both failures so the user sees what was tried.
+    #[test]
+    fn http_405_without_sse_reports_both_failures() {
+        use super::{HttpTransport, Transport, TransportError};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut conn = listener.accept().unwrap().0;
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while conn.read(&mut byte).unwrap() > 0 {
+                    buf.push(byte[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                // Drain any request body before answering, so the close after the
+                // response isn't seen as a reset by the client.
+                let headers = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                if let Some(len) = headers.lines().find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                }) {
+                    let mut raw = vec![0u8; len];
+                    conn.read_exact(&mut raw).unwrap();
+                }
+                // Both POST and GET get 405.
+                conn.write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::new(&url);
+        let err = t.request("initialize", json!({})).unwrap_err();
+        let TransportError::Fatal(msg) = err else {
+            panic!("expected Fatal, got {err:?}");
+        };
+        assert!(msg.contains("HTTP 405"), "missing original error: {msg}");
+        assert!(
+            msg.contains("legacy HTTP+SSE"),
+            "missing probe context: {msg}"
+        );
+        server_handle.join().unwrap();
+    }
 
     #[test]
     fn ssrf_resolver_screens_resolved_addresses() {
