@@ -130,9 +130,27 @@ fn vendors() -> &'static [Vendor] {
     ]
 }
 
+fn second_level_label(host: &str) -> Option<&str> {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    Some(labels[labels.len() - 2])
+}
+
 fn match_vendor(url: &str) -> Option<&'static Vendor> {
     let host = url::Url::parse(url).ok()?.host_str()?.to_lowercase();
-    vendors().iter().find(|v| host.contains(v.needle))
+    let sld = second_level_label(&host);
+
+    vendors().iter().find(|v| {
+        if v.needle.contains('.') {
+            host == v.needle || host.ends_with(&format!(".{}", v.needle))
+        } else {
+            sld.is_some_and(|label| {
+                label == v.needle || label.starts_with(v.needle) || label.ends_with(v.needle)
+            })
+        }
+    })
 }
 
 /// Decide what a server needs: try connecting with no auth; if it works it needs
@@ -189,6 +207,9 @@ mod tests {
         );
 
         assert!(match_vendor("https://mcp.composio.dev/clerk").is_none());
+
+        assert!(match_vendor("https://clerk.evil.com").is_none());
+        assert!(match_vendor("https://stripe.com.evil.dev").is_none());
     }
 
     #[test]

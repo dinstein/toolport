@@ -12,10 +12,16 @@ Integrations -> "Open WebUI / HTTP endpoint"**, flip it on, and copy the **URL**
 (`http://localhost:8765`) and the **token** it shows. The app supervises the
 gateway for you and shuts it down when you quit.
 
-> Prefer the command line? `toolport-gateway --http 8765` (or `TOOLPORT_HTTP=8765`)
-> does the same thing when `TOOLPORT_HTTP_TOKEN=<your-token>` is set (the app does
-> this automatically). It serves an OpenAPI spec at
-> `http://localhost:8765/openapi.json` and a POST endpoint per tool.
+> Prefer the command line? `toolport-gateway --http 8765` does the same thing when
+> `TOOLPORT_HTTP_TOKEN=<your-token>` is set (the app does this automatically). It
+> serves an OpenAPI spec at `http://localhost:8765/openapi.json` and a POST endpoint
+> per tool.
+>
+> `TOOLPORT_HTTP=8765` also works from an interactive shell, but **use the `--http`
+> flag in scripts, services, and containers**. HTTP mode replaces the stdio
+> transport, so the gateway deliberately ignores the environment variable when its
+> stdin is a pipe — otherwise a machine-wide `TOOLPORT_HTTP` would turn the gateway
+> every MCP client spawns into another HTTP server fighting over this port.
 
 **2. Add it to Open WebUI.** Settings -> Tools -> add an OpenAPI tool server
 pointing at `http://localhost:8765`, and paste the **token** as its API key

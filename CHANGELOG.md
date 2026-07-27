@@ -6,6 +6,74 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.9.6] - 2026-07-27
+
+Client config ownership, Shared HTTP connect, code mode v2 (parallel + typed stubs),
+native resource subscriptions, gateway hardening, and safer vendor matching.
+
+### Discovery
+
+**Code mode on by default.** `toolport_run_script` is advertised unless you turn **Code
+mode** off in Settings (or set `"codeMode": false` in the registry). Each in-script call
+still hits the same scope and approval gates as `toolport_call_tool`. Code mode is not a
+security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
+Existing registries that already store `"codeMode": false` stay off. (SOU-397)
+
+**Code mode parallel calls and typed stubs.** Scripts get `callAsync` / `Promise.all`
+with bounded host parallelism, scoped `servers.*` typed stubs, full intermediate
+results and `fetchResult` handoff. (#480–#483 / SOU-348)
+
+### Added
+
+**Per-client transport: Spawn (stdio) or Shared HTTP.** Integrations can connect a
+client to the supervised HTTP bridge instead of spawning its own gateway. Native
+remote shapes (VS Code, OpenCode, Qwen, Hermes, Continue) get a url + bearer entry;
+clients that only support stdio (Claude Desktop, etc.) get an opt-in `npx mcp-remote`
+bridge. Tokens are vaulted; ownership records never store bearers. (SOU-407)
+
+**Native MCP resource subscriptions.** Subscribe/unsubscribe and `resources/updated`
+fanout (with producer verification), resource templates + completions, paginated
+catalogs preserved. (#474–#479, #484)
+
+### Fixed
+
+**Client gateway ownership is now a first-class state (Managed / Customized /
+Absent).** Toolport records what it last wrote into each client's config and surfaces
+hand-edited entries as "custom configuration" in Integrations, with an explicit Reset
+to default (confirm before overwrite). Launch re-point and Connect no longer silently
+clobber a customized entry. Pre-ownership installs still use the command-basename
+heuristic. (SOU-406, follow-up to #487)
+
+**A hand-edited gateway entry is no longer reverted on every app launch.** The
+launch-time re-point recognized its own entry by _name_, so an entry still called
+`toolport` but pointed at something else - an `mcp-remote` bridge against the HTTP
+endpoint, a container, a wrapper script - was treated as a stale install and rewritten
+back to the default stdio command every time the app started. Re-pointing now requires
+the stored command to actually name a Toolport gateway binary; anything else is treated
+as user-managed and left exactly as written (and the skip is logged). Genuine
+migrations - an older version, the pre-rename `conduit-gateway`, the pre-rename data
+directory, an unversioned install path - are unaffected. (#487, #488)
+
+**A machine-wide `TOOLPORT_HTTP` / `CONDUIT_HTTP` no longer hijacks client-spawned
+gateways.** HTTP mode replaces the stdio transport, so an inherited value left every
+MCP client with a gateway that never answered its pipe, and every gateway after the
+first colliding on the shared port (`WSAEADDRINUSE`) - which some clients treat as
+fatal. The env forms are now ignored, with a warning, when stdin is a pipe. The
+desktop app, the Docker images, and the documented headless setup all pass `--http`
+explicitly and are unaffected; use the flag in scripts and services too. (#487)
+
+**Vendor auth hints match on domain-label boundaries only.** Bare needles like
+`clerk` / `github` no longer match attacker subdomains (`clerk.evil.com`), and full
+domain needles require a real host suffix. Spoofed hosts can no longer skip the live
+probe via `force_kind`. (#417, #492)
+
+**Headless `secrets.enc` set/delete is locked** against concurrent writers. (SOU-332)
+
+**Profile scope tool-fetch UI** shows failures, ignores stale errors after a newer
+load, and scopes loading state per server. (#468)
+
+**Search efficiency and routed-call audit overhead** improvements. (#472, #473)
+
 ## [1.9.5] - 2026-07-25
 
 Finishes the Conduit → Toolport rename for what users and configs see, keeps

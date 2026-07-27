@@ -30,6 +30,15 @@ release with auto-generated notes. Replace or augment the body with
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.
 
+## After users upgrade
+
+On each app launch Toolport **stops obsolete gateway processes** (older versioned
+binaries and stale paths), keeping the current published/resolved gateway. Clients
+that auto-respawn MCP pick up the new binary on the **next tool call** without a
+full agent restart. Settings → Integrations → **Stop old gateways** runs the same
+cleanup on demand. The in-app updater still kills **all** gateway processes before
+install so locked files can be replaced.
+
 ## Manual fallback
 
 If you'd rather build locally:

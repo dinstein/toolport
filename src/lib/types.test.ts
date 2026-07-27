@@ -44,6 +44,7 @@ describe("gateway identity", () => {
       ],
       pluginServers: [],
       gatewayInstalled: true,
+      entryState: "managed",
       error: null,
     };
 

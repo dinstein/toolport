@@ -339,12 +339,24 @@ impl ResourceSubscriptionTable {
             .collect()
     }
 
+    /// First-writer owner recorded at subscribe time, if any (SOU-398).
+    fn owner_for(&self, uri: &str) -> Option<&str> {
+        self.uri_owner.get(uri).map(String::as_str)
+    }
+
     fn set_owner(&mut self, uri: &str, owner: &str) {
         if self.uri_owner.contains_key(uri) {
             self.uri_owner.insert(uri.to_string(), owner.to_string());
         }
     }
 }
+
+/// Shared fanout entry for `notifications/resources/updated`:
+/// `(producer_server_id, uri)`. Ownership is checked before any upstream
+/// delivery so a misbehaving server cannot spoof updates for URIs it does not
+/// own (SOU-398). Bound per downstream at connect time into a
+/// [`ResourceUpdatedSink`] that closes over the producer id.
+type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedLine {
@@ -543,21 +555,20 @@ fn run_script_tool_def() -> Value {
     json!({
         "name": "toolport_run_script",
         "description": "Run ONE JavaScript orchestration script server-side instead of making \
-            many separate tool calls. Inside the script, call downstream tools with \
-            `toolport.call(name, args)` (name = the exact tool name from toolport_search_tools, \
-            args = its arguments object); it returns that tool's result as a value. Loop, branch, \
-            and combine results, then `return` a single aggregated value - only the returned value \
-            comes back, so intermediate results never fill your context and a multi-step task \
-            costs one round-trip. Each call still passes the same gates as toolport_call_tool \
-            (scope, human approval). Synchronous: call tools one after another (no await / \
-            Promises). Best when you already know the steps; use toolport_search_tools + \
-            toolport_call_tool while you are still exploring.",
+            many separate tool calls. Prefer the typed surface when you know the server: \
+            `servers.stripe.create_refund({...})` (sync) or `servers.stripe.createRefund.async({...})` \
+            (Promise; fan out with Promise.all / await). Also: `toolport.call`, `callAsync`, \
+            `callAll`, `fetchResult({cursor, offset, projection})`, `listTools()`, `listServers()`. \
+            Intermediate tool results are full-sized inside the script (not context-budget shaped); \
+            only your returned aggregate is shaped for the model. Loop, branch, project, then \
+            `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
+            approval). Best when you already know the steps; explore with toolport_search_tools first.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Call tools with toolport.call(name, args) and `return` the final value. The optional `data` payload below is available as the global `data`."
+                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll / fetchResult; `return` the final value (top-level await ok). Intermediate results are full-sized in-script. Global `data` is the optional payload below."
                 },
                 "data": {
                     "type": "object",
@@ -792,13 +803,14 @@ fn grouped_discovery() -> bool {
     discovery_mode() == DiscoveryMode::Grouped
 }
 
-/// Opt-in gate for server-side "code mode" (the `toolport_run_script` meta-tool). Off by
-/// default: code mode runs an agent-supplied JS script that can call many tools in one
-/// round-trip, a powerful capability worth an explicit opt-in even under Toolport's local
-/// trust model. Enabled by the registry's `code_mode` toggle (the Settings switch, synced
-/// into [`CODE_MODE`]); `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
-/// force-enables regardless, for power users and tests. When off, `run_script` is
-/// neither advertised nor dispatched.
+/// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+///
+/// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
+/// switch, synced into [`CODE_MODE`]). Kill switch: turn Settings off. Code mode runs
+/// agent-supplied JS and is not a security boundary; each host call still passes the same
+/// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
+/// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
+/// is neither advertised nor dispatched.
 fn code_mode_enabled() -> bool {
     let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
     env_forced || CODE_MODE.load(Ordering::Relaxed)
@@ -2843,8 +2855,9 @@ impl RoutedCallProfiler {
 /// `confirm` is `Some` only on the interactive direct path, where a destructive tool can be
 /// held for the agent's `toolport_confirm` token replay. Inside a script that two-step
 /// handshake can't happen, so `confirm` is `None` and such a call fails closed rather than
-/// running unconfirmed. `confirmed` is true only when the call already came back through
+/// running unconfirmed. `opts.confirmed` is true only when the call already came back through
 /// `toolport_confirm` (skips the approval + confirm gates so it isn't re-intercepted).
+/// `opts.shape` controls byte-budget shaping (see [`CallOpts`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     reg: &Registry,
@@ -2856,8 +2869,10 @@ fn execute_call(
     confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
-    mut confirmed: bool,
+    opts: CallOpts,
 ) -> Value {
+    let mut confirmed = opts.confirmed;
+    let shape = opts.shape;
     let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
@@ -3105,7 +3120,7 @@ fn execute_call(
             } else {
                 recovery_hint(cached, srv)
             };
-            let out = defend_and_shape(reg, srv, tool, client, result, &trailer);
+            let out = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -3160,9 +3175,28 @@ fn execute_call(
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             });
-            defend_and_shape(reg, srv, tool, client, result, &recovery_hint(cached, srv))
+            defend_and_shape(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &recovery_hint(cached, srv),
+                shape,
+            )
         }
     }
+}
+
+/// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
+#[derive(Clone, Copy)]
+struct CallOpts {
+    /// True after a successful `toolport_confirm` replay (skip re-approval/confirm).
+    confirmed: bool,
+    /// When false, content defense still runs but result-shaping is skipped. Code-mode
+    /// intermediate calls pass full bodies into the sandbox (they never enter model
+    /// context); only the script's final aggregate is shaped for the client.
+    shape: bool,
 }
 
 /// Run untrusted tool-call output through content defense and result shaping, then
@@ -3182,6 +3216,7 @@ fn defend_and_shape(
     client: Option<&str>,
     mut result: Value,
     trailer: &str,
+    shape: bool,
 ) -> Value {
     // Scan untrusted output for injection; label always, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -3199,20 +3234,24 @@ fn defend_and_shape(
     }
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
-    let budget = reg
-        .result_budgets
-        .get(srv)
-        .map(|&b| b as usize)
-        .unwrap_or_else(|| {
-        let (budget, warning) = shaping::budget();
+    // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
+    // sandbox; only the script's final aggregate is shaped for the model.
+    if shape {
+        let budget = reg
+            .result_budgets
+            .get(srv)
+            .map(|&b| b as usize)
+            .unwrap_or_else(|| {
+                let (budget, warning) = shaping::budget();
 
-        if let Some(msg) = warning {
-            eprintln!("{msg}");
-        }
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
 
-        budget
-    });
-    shaping::shape_result(&mut result, budget, client);
+                budget
+            });
+        shaping::shape_result(&mut result, budget, client);
+    }
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
     if !trailer.is_empty() {
@@ -3221,6 +3260,40 @@ fn defend_and_shape(
         }
     }
     result
+}
+
+/// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
+/// meta-tools, optionally filtered to the client's allowed server prefixes.
+///
+/// Scope matching uses [`server_in_allowed_scope`] (SOU-327) so hyphenated server ids
+/// sanitize the same way as `execute_call` / tools-list filtering. Bare names (no
+/// `server__tool` separator) are dropped: they cannot become `servers.*` stubs and must
+/// not appear in `listTools` as if they were catalog entries.
+fn script_catalog_tools(
+    cached: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut names: Vec<String> = cached
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|n| !codemode::is_code_mode_meta_tool(n))
+        .filter(|n| {
+            let Some((server, tool)) = codemode::split_exposed_name(n) else {
+                return false;
+            };
+            if server.is_empty() || tool.is_empty() {
+                return false;
+            }
+            match allowed {
+                Some(set) => server_in_allowed_scope(server, set),
+                None => true,
+            }
+        })
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Dispatch a `toolport_run_script` "code mode" call: run the agent's script in the boa
@@ -3266,8 +3339,11 @@ fn run_script_dispatch(
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
 
-    let call: std::rc::Rc<dyn Fn(&str, Value) -> Value> =
-        std::rc::Rc::new(move |name: &str, args: Value| {
+    // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
+    // shape=false: intermediate results stay full-sized in the sandbox (never enter model
+    // context). Content defense still runs. Final aggregate is shaped below.
+    let call: codemode::CallBinding =
+        Arc::new(move |name: &str, args: Value| {
             execute_call(
                 &reg_owned,
                 &router_owned,
@@ -3278,11 +3354,36 @@ fn run_script_dispatch(
                 None,
                 name,
                 args,
-                false,
+                CallOpts {
+                    confirmed: false,
+                    shape: false,
+                },
             )
         });
 
-    let outcome = codemode::run_script(&script, data, call, codemode::Limits::default());
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
+    let client_for_fetch = client.map(str::to_string);
+    let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
+        shaping::fetch_result(
+            &args.cursor,
+            args.offset,
+            args.len,
+            client_for_fetch.as_deref(),
+            args.projection.as_deref(),
+        )
+    });
+
+    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
+    let catalog = script_catalog_tools(cached, allowed);
+
+    let outcome = codemode::run_script(
+        &script,
+        data,
+        call,
+        Some(fetch),
+        codemode::Limits::default(),
+        &catalog,
+    );
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -3308,10 +3409,10 @@ fn run_script_dispatch(
         }
     };
 
-    // Each toolport.call() result is shaped independently, but a script can aggregate
-    // many individually bounded results into one response that is far larger than the
-    // client transport can safely decode. Shape the final aggregate as one unit too.
-    // The full aggregate remains available through toolport_fetch_result's cursor.
+    // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
+    // script's aggregate can still blow the transport/context budget, so shape only
+    // this final result; the full aggregate remains available via toolport_fetch_result
+    // (or toolport.fetchResult inside a later script).
     let (budget, warning) = shaping::budget();
     if let Some(msg) = warning {
         eprintln!("{msg}");
@@ -3411,9 +3512,8 @@ fn handle_request_with_cancel(
                     call_tool_def(),
                     fetch_result_tool_def(),
                 ];
-                // Opt-in code mode: one script that orchestrates many calls in a single
-                // round-trip. Advertised only when enabled, same visibility discipline as
-                // the agent-control tools below.
+                // Code mode (on by default, Settings kill switch): one script that
+                // orchestrates many calls in a single round-trip.
                 if code_mode_enabled() {
                     tools.push(run_script_tool_def());
                 }
@@ -3964,7 +4064,10 @@ fn handle_request_with_cancel(
                     Some(confirm),
                     name.as_str(),
                     arguments,
-                    confirmed,
+                    CallOpts {
+                        confirmed,
+                        shape: true,
+                    },
                 ),
             ))
         }
@@ -4198,8 +4301,9 @@ fn build_router(
     // already decoded to a filesystem path. `None` in HTTP mode and before the
     // client's roots are known; `${ROOT}` servers then fall back to the gateway cwd.
     root: Option<&str>,
-    // Optional sink for downstream `notifications/resources/updated` (SOU-394).
-    resource_updated: Option<ResourceUpdatedSink>,
+    // Optional dispatch for downstream `notifications/resources/updated`
+    // (SOU-394); bound per server with producer id (SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
     // Live subscription table so reconnect factories re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) -> Router {
@@ -4334,6 +4438,19 @@ fn build_router(
     router
 }
 
+/// Bind a shared resource-updated dispatch to one producer server id so the
+/// transport-level sink only needs the URI (SOU-398).
+fn bind_resource_updated_sink(
+    dispatch: &ResourceUpdatedDispatch,
+    producer: &str,
+) -> ResourceUpdatedSink {
+    let dispatch = Arc::clone(dispatch);
+    let producer = producer.to_string();
+    Arc::new(move |uri: String| {
+        dispatch(producer.clone(), uri);
+    })
+}
+
 /// Connect a single enabled server (stdio with keychain secret injection, or
 /// remote with refresh-aware auth). Returns None on failure.
 fn connect_one(
@@ -4341,8 +4458,12 @@ fn connect_one(
     dirty: &Arc<AtomicU8>,
     server_handler: ServerRequestHandler,
     root: Option<&str>,
-    resource_updated: Option<ResourceUpdatedSink>,
+    resource_updated: Option<ResourceUpdatedDispatch>,
 ) -> Option<DownstreamServer> {
+    // Close over this server's id so fanout can verify the producer (SOU-398).
+    let resource_updated = resource_updated
+        .as_ref()
+        .map(|d| bind_resource_updated_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
@@ -4472,17 +4593,33 @@ fn fanout_mcp_notification(
 
 /// Deliver `notifications/resources/updated` only to sessions that subscribed
 /// to `uri` (stdio + HTTP SSE). Distinct from list_changed fanout (SOU-394).
+///
+/// `producer` is the downstream server id that emitted the notification. Fanout
+/// only proceeds when that id matches the URI's first-writer owner (SOU-398);
+/// spoofed or colliding updates are dropped and logged.
 fn deliver_resource_updated(
     stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+    producer: &str,
     uri: &str,
 ) {
     let targets = {
         let table = subs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        table.sessions_for_uri(uri)
+        match table.owner_for(uri) {
+            Some(owner) if owner == producer => table.sessions_for_uri(uri),
+            Some(owner) => {
+                eprintln!(
+                    "toolport: resources/updated for '{uri}' from '{producer}' dropped \
+                     (owned by '{owner}')"
+                );
+                return;
+            }
+            // No active subscription for this URI — same as empty targets.
+            None => return,
+        }
     };
     if targets.is_empty() {
         return;
@@ -4530,15 +4667,16 @@ fn deliver_resource_updated(
     }
 }
 
-/// Build the drain-thread sink that fans resource-updated notifications to
-/// subscribed upstream clients only (SOU-394).
+/// Build the shared dispatch that fans resource-updated notifications to
+/// subscribed upstream clients only (SOU-394), after verifying the producer
+/// owns the URI (SOU-398). Bound per downstream via [`bind_resource_updated_sink`].
 fn make_resource_updated_sink(
     stdout: Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     subs: Arc<Mutex<ResourceSubscriptionTable>>,
-) -> ResourceUpdatedSink {
-    Arc::new(move |uri: String| {
-        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &uri);
+) -> ResourceUpdatedDispatch {
+    Arc::new(move |producer: String, uri: String| {
+        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &producer, &uri);
     })
 }
 
@@ -5206,8 +5344,9 @@ fn watch_registry(
     // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
     // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
-    // Resource-updated sink re-wired into rebuilds after registry reload (SOU-394).
-    resource_updated: Option<ResourceUpdatedSink>,
+    // Resource-updated dispatch re-wired into rebuilds after registry reload
+    // (SOU-394 / SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
     // Subscription table so rebuilds re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) {
@@ -5266,7 +5405,7 @@ fn watch_tick(
     server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
-    resource_updated: Option<&ResourceUpdatedSink>,
+    resource_updated: Option<&ResourceUpdatedDispatch>,
     resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
@@ -5550,9 +5689,10 @@ struct GatewayState {
     env_profile: Option<String>,
     /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
     resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
-    /// Drain-thread sink that delivers `notifications/resources/updated` to
-    /// subscribed clients. Shared with every stdio downstream spawn/reconnect.
-    resource_updated_sink: Option<ResourceUpdatedSink>,
+    /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
+    /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
+    /// server at connect/reconnect.
+    resource_updated_sink: Option<ResourceUpdatedDispatch>,
 }
 
 /// Client capabilities the upstream MCP client declared at `initialize`.
@@ -6531,10 +6671,13 @@ fn handle_stdio_request(
     }
 }
 
+/// `stdio_peer` is true when stdin is a pipe rather than a terminal, i.e. an MCP
+/// client spawned this process and is waiting to speak JSON-RPC on it.
 fn resolve_http_port(
     cli_port: Option<u16>,
     http: Option<&str>,
     http_port: Option<&str>,
+    stdio_peer: bool,
 ) -> (Option<u16>, Option<String>) {
     // CLI flag has highest priority.
     if let Some(port) = cli_port {
@@ -6546,6 +6689,27 @@ fn resolve_http_port(
     let v = v.trim();
     if v.is_empty() {
         return (None, None);
+    }
+    // Ambient env + a client on the other end of stdin: ignore the env (issue #487).
+    // HTTP mode REPLACES the stdio loop rather than running beside it, so honoring a
+    // machine-wide TOOLPORT_HTTP here hands the client a gateway that never answers
+    // its pipe - and every client that starts after the first also collides on the
+    // shared port (WSAEADDRINUSE / os error 10048), which some clients treat as fatal.
+    // The env var is a global, so one stray `setx` breaks every client at once.
+    //
+    // The desktop app starts its bridge with an explicit `--http`, handled above and
+    // unaffected. A human running the gateway by hand has a terminal on stdin and
+    // still gets the env form. Anything else - a service, or a detached run with stdin
+    // redirected from null - now has to say `--http` out loud, which the warning says.
+    if stdio_peer {
+        return (
+            None,
+            Some(format!(
+                "toolport: ignoring TOOLPORT_HTTP/CONDUIT_HTTP='{v}' from the environment - this \
+                 gateway was spawned by a client on stdio, and HTTP mode would replace the stdio \
+                 transport that client is waiting on. Pass --http explicitly to run the HTTP bridge."
+            )),
+        );
     }
     if let Ok(port) = v.parse::<u16>() {
         if port > 0 {
@@ -6573,7 +6737,12 @@ fn resolve_http_port(
 /// Resolve the HTTP port. `--http [port]` on the command line wins; otherwise
 /// `CONDUIT_HTTP=<port>` is the direct env form, and a truthy `CONDUIT_HTTP`
 /// falls back to `CONDUIT_HTTP_PORT` or 8765. Absent everywhere -> stdio mode.
+///
+/// The env forms are ignored (with a warning) when a client spawned us on stdio, so a
+/// machine-wide `TOOLPORT_HTTP` can't silently turn every client's gateway into a
+/// racing HTTP server - see [`resolve_http_port`] and issue #487.
 fn http_port() -> (Option<u16>, Option<String>) {
+    use std::io::IsTerminal;
     // CLI flag: `toolport-gateway --http` (default 8765) or `--http 9000`.
     let args: Vec<String> = std::env::args().collect();
     let cli_port = args
@@ -6589,11 +6758,9 @@ fn http_port() -> (Option<u16>, Option<String>) {
         });
     let http = conduit_lib::brand::env_var("TOOLPORT_HTTP", "CONDUIT_HTTP");
     let http_port = conduit_lib::brand::env_var("TOOLPORT_HTTP_PORT", "CONDUIT_HTTP_PORT");
-    resolve_http_port(
-        cli_port,
-        http.as_deref(),
-        http_port.as_deref(),
-    )
+    // A client that spawns us over stdio gives us a pipe; a human gets a terminal.
+    let stdio_peer = !std::io::stdin().is_terminal();
+    resolve_http_port(cli_port, http.as_deref(), http_port.as_deref(), stdio_peer)
 }
 
 /// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
@@ -8758,7 +8925,7 @@ mod tests {
             "content": [{ "type": "text", "text": payload }],
             "isError": true,
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("external data"), "error text must be labeled as data");
         assert!(text.contains("evil-server"), "wrapper names the originating server");
@@ -8769,7 +8936,7 @@ mod tests {
             "content": [{ "type": "text", "text": "e".repeat(200_000) }],
             "isError": true,
         });
-        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "");
+        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true);
         let shaped_text = shaped["content"][0]["text"].as_str().unwrap();
         assert!(
             shaped_text.len() < 200_000,
@@ -8780,7 +8947,7 @@ mod tests {
         // The Toolport-authored trailer is appended after the scan, as its own block,
         // so it is never wrapped as external data.
         let clean = json!({ "content": [{ "type": "text", "text": "not found" }], "isError": true });
-        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.");
+        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.", true);
         let blocks = with_hint["content"].as_array().unwrap();
         let trailer = blocks.last().unwrap()["text"].as_str().unwrap();
         assert_eq!(trailer, "Try list_things first.");
@@ -8797,7 +8964,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true, "blocked call must be isError");
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("blocked"), "security message");
@@ -8817,7 +8984,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_ne!(
             out["content"][0]["text"].as_str().unwrap().starts_with("Toolport: blocked"),
             true,
@@ -8836,7 +9003,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert!(
             out["content"][0]["text"]
                 .as_str()
@@ -8857,7 +9024,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true);
         assert!(
             out["content"][0]["text"]
@@ -9179,13 +9346,13 @@ mod tests {
         assert_eq!(result["structuredContent"]["result"]["sum"], 60);
     }
 
-    /// A code-mode script can combine several individually shaped downstream results.
-    /// The final aggregate must itself stay within the gateway result budget, otherwise
-    /// large single-line JSON-RPC responses can break client transport decoders.
+    /// Intermediate tool results stay full-sized inside the script; only the final
+    /// aggregate is shaped for the model. Scripts can filter/project huge bodies in JS.
     #[test]
     fn run_script_shapes_oversized_final_aggregate() {
         let reg = Registry::default();
-        let router = Arc::new(paging_router("x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2)));
+        let body = "x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(body.clone()));
         let args = json!({
             "script": "return [ \
                 toolport.call('s__big', {}), \
@@ -9226,9 +9393,78 @@ mod tests {
             serde_json::from_str(fetched_text).expect("complete fetched aggregate");
         let calls = aggregate.as_array().expect("script returned an array");
         assert_eq!(calls.len(), 4);
-        assert!(calls.iter().all(|call| call["content"][0]["text"]
+        // Intermediates were NOT shaped: full bodies (or structured) available to the script.
+        assert!(calls.iter().all(|call| {
+            let text = call["content"][0]["text"].as_str().unwrap_or("");
+            !text.contains("Toolport shaped this result")
+                && (text.contains(&body) || call.get("structuredContent").is_some())
+        }));
+    }
+
+    /// Script sees the full oversized intermediate and can return a small projection.
+    #[test]
+    fn run_script_can_project_large_intermediate_without_cursor() {
+        let reg = Registry::default();
+        let big = "y".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(big.clone()));
+        let args = json!({
+            "script": "var r = toolport.call('s__big', {}); \
+                       var t = r.content[0].text; \
+                       return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
+        });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["shaped"], false);
+        assert_eq!(v["len"], big.chars().count() as u64); // or as number
+        assert_eq!(v["head"], "yyyyyyyy");
+    }
+
+    /// toolport.fetchResult pages a shaped stash (same owner rules as toolport_fetch_result).
+    #[test]
+    fn run_script_fetch_result_reads_shaped_cursor() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("z".to_string()));
+        // Seed the shaping cache as a prior shaped agent-facing result would.
+        // Body must dominate the envelope so shape_result actually caches (half-size rule).
+        let payload = format!("hello{}", "x".repeat(2000));
+        let mut seeded = json!({
+            "content": [{ "type": "text", "text": payload }],
+            "isError": false
+        });
+        assert!(
+            shaping::shape_result(&mut seeded, 512, Some("alice")),
+            "seed must shape so a cursor exists"
+        );
+        let seed_text = seeded["content"][0]["text"].as_str().unwrap();
+        let cursor = seed_text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("seed cursor");
+
+        let args = json!({
+            "script": format!(
+                "var page = toolport.fetchResult({{ cursor: '{cursor}', offset: 0, len: 5 }}); \
+                 return page.content[0].text;"
+            ),
+        });
+        // Client owner must match the stash owner.
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            Some("alice"),
+            None,
+            None,
+            &args,
+        );
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let text = result["structuredContent"]["result"]
             .as_str()
-            .is_some_and(|body| body.contains("Toolport shaped this result"))));
+            .unwrap_or("");
+        // fetch_result returns the page plus a Toolport footer; head is the body slice.
+        assert!(text.starts_with("hello"), "got {text}");
     }
 
     /// The per-client scope guard applies to a call made INSIDE a script exactly as it does
@@ -9251,6 +9487,87 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not available to this client"));
+    }
+
+    /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
+    /// servers are absent from `servers` / listServers even if present in the full cache.
+    #[test]
+    fn run_script_servers_stubs_are_scope_filtered() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hi".to_string()));
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("other".to_string());
+        let cached = vec![
+            json!({ "name": "s__big" }),
+            json!({ "name": "other__thing" }),
+            json!({ "name": "toolport_status" }),
+            json!({ "name": "bare_override" }), // no server__tool shape
+        ];
+        let args = json!({
+            "script": "return { \
+                servers: toolport.listServers().sort(), \
+                tools: toolport.listTools().sort(), \
+                hasS: typeof servers.s, \
+                hasOther: typeof servers.other \
+            };"
+        });
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            Some("scoped"),
+            Some(&allowed),
+            None,
+            &args,
+        );
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["servers"], json!(["other"]));
+        assert_eq!(v["tools"], json!(["other__thing"]));
+        assert_eq!(v["hasS"], json!("undefined"));
+        assert_eq!(v["hasOther"], json!("object"));
+    }
+
+    /// SOU-327 / CodeRabbit #481: catalog scope must sanitize like tools-list filtering.
+    /// Allowed stores sanitize_segment form; raw or already-sanitized server segments match.
+    #[test]
+    fn script_catalog_tools_uses_server_in_allowed_scope() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("file_system".to_string());
+        let cached = vec![
+            json!({ "name": "file_system__read" }),
+            json!({ "name": "other__tool" }),
+            json!({ "name": "toolport_call_tool" }),
+            json!({ "name": "no_separator" }),
+        ];
+        let names = script_catalog_tools(&cached, Some(&allowed));
+        assert_eq!(names, vec!["file_system__read".to_string()]);
+        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        let all = script_catalog_tools(&cached, None);
+        assert_eq!(
+            all,
+            vec![
+                "file_system__read".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
+    }
+
+    /// End-to-end: a typed stub routes through execute_call like toolport.call.
+    #[test]
+    fn run_script_servers_stub_aggregates_downstream() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hello".to_string()));
+        let cached = vec![json!({ "name": "s__big" })];
+        let args = json!({
+            "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
+        assert_eq!(result["structuredContent"]["result"], "Alice");
     }
 
     /// Safety: a destructive tool called INSIDE a script fails closed when per-call
@@ -9315,12 +9632,15 @@ mod tests {
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
 
-    /// With `CONDUIT_CODE_MODE` unset (the default), the dispatch refuses `toolport_run_script`
-    /// so the capability is opt-in. (`handle_request` also passes no router Arc, a second
-    /// fail-closed.)
+    /// Kill switch path: when the live flag is off (test default atomic + no env),
+    /// dispatch refuses `toolport_run_script`. Production seeds the flag from the
+    /// registry at boot (now default true); this covers the Settings-off path.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        let reg = Registry::default();
+        // Do not flip the global CODE_MODE atomic here: tests run in parallel.
+        // Atomic defaults false; env must be unset for this assertion.
+        let mut reg = Registry::default();
+        reg.code_mode = false;
         let router = routed_router("s", "tool");
         let req = json!({
             "jsonrpc": "2.0",
@@ -9346,6 +9666,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("code mode is disabled"));
+    }
+
+    #[test]
+    fn code_mode_defaults_on_in_registry() {
+        // SOU-397: new registries and missing serde field default on. Explicit
+        // false remains the kill switch (camelCase field name in JSON).
+        assert!(Registry::default().code_mode);
+        let minimal = r#"{"version":1,"servers":[],"profiles":[]}"#;
+        let parsed: Registry = serde_json::from_str(minimal).unwrap();
+        assert!(parsed.code_mode, "missing codeMode field should default true");
+        let explicit_off: Registry =
+            serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
+                .unwrap();
+        assert!(!explicit_off.code_mode);
     }
 
     fn router() -> Router {
@@ -11477,6 +11811,7 @@ mod tests {
             &state.stdout,
             &state.mcp_sessions,
             &state.resource_subs,
+            "srv",
             "fixture://only-s1",
         );
         let sessions = state.mcp_sessions.lock().unwrap();
@@ -11495,6 +11830,89 @@ mod tests {
             "subscribed session missing update: {chunk1}"
         );
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
+    }
+
+    #[test]
+    fn deliver_resource_updated_drops_cross_server_spoof() {
+        // SOU-398: a server that does not own the URI must not fan out updates.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table
+                .add(&s1, "fixture://owned-by-alpha", "alpha")
+                .unwrap();
+        }
+        // Spoof: beta claims an update for alpha's URI.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "beta",
+            "fixture://owned-by-alpha",
+        );
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            let sess = sessions.get(&s1).unwrap();
+            let out = sess.outbound.lock().unwrap();
+            assert!(
+                out.is_empty(),
+                "cross-server spoof must not reach subscribers (got {} message(s))",
+                out.len()
+            );
+        }
+        // Legitimate owner still fans out.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://owned-by-alpha",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let chunk = {
+            let sess = sessions.get(&s1).unwrap();
+            let mut out = sess.outbound.lock().unwrap();
+            out.pop_front().map(|m| m.json).unwrap_or_default()
+        };
+        assert!(
+            chunk.contains("resources/updated") && chunk.contains("fixture://owned-by-alpha"),
+            "owner producer must still deliver: {chunk}"
+        );
+    }
+
+    #[test]
+    fn deliver_resource_updated_silent_when_unsubscribed() {
+        // Unsolicited update for a URI with no local subscription: drop, no panic.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://nobody-subbed",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let sess = sessions.get(&s1).unwrap();
+        assert!(sess.outbound.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resource_subscription_owner_for_matches_first_writer() {
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "alpha").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        // Second session cannot change owner via insert path.
+        table.add("s2", "file://a", "beta").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        assert_eq!(table.owner_for("file://missing"), None);
     }
 
     #[test]
@@ -12876,17 +13294,29 @@ mod tests {
     #[test]
     fn resolve_http_port_cases() {
         // CLI port wins over everything.
-        assert_eq!(resolve_http_port(Some(9000), Some("8000"), Some("7000")), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(Some(9000), Some("8000"), Some("7000"), false),
+            (Some(9000), None)
+        );
         // Direct port form: CONDUIT_HTTP=9000.
-        assert_eq!(resolve_http_port(None, Some("9000"), None), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(None, Some("9000"), None, false),
+            (Some(9000), None)
+        );
         // Truthy CONDUIT_HTTP uses CONDUIT_HTTP_PORT.
-        assert_eq!(resolve_http_port(None, Some("true"), Some("9001")), (Some(9001), None));
+        assert_eq!(
+            resolve_http_port(None, Some("true"), Some("9001"), false),
+            (Some(9001), None)
+        );
         // Truthy CONDUIT_HTTP without a port falls back to default.
-        assert_eq!(resolve_http_port(None, Some("yes"), None), (Some(8765), None));
+        assert_eq!(
+            resolve_http_port(None, Some("yes"), None, false),
+            (Some(8765), None)
+        );
         // No HTTP configuration means stdio mode.
-        assert_eq!(resolve_http_port(None, None, None), (None, None));
+        assert_eq!(resolve_http_port(None, None, None, false), (None, None));
         // Invalid value returns no port and warning.
-        let (port, warning) = resolve_http_port(None, Some("invalid"), None);
+        let (port, warning) = resolve_http_port(None, Some("invalid"), None, false);
         assert_eq!(port, None);
         assert_eq!(
             warning.as_deref(),
@@ -12894,6 +13324,40 @@ mod tests {
                 "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
             )
         );
+    }
+
+    #[test]
+    fn ambient_http_env_is_ignored_when_a_client_spawned_us() {
+        // Regression for issue #487. A machine-wide TOOLPORT_HTTP/CONDUIT_HTTP is
+        // inherited by every client, and every gateway those clients spawn. HTTP mode
+        // REPLACES the stdio loop, so honoring it here would leave each client with a
+        // gateway that never answers its pipe, and every gateway after the first
+        // colliding on the shared port (WSAEADDRINUSE) - which some clients treat as
+        // fatal. Ignore the env and serve stdio, loudly.
+        for value in ["1", "true", "on", "yes", "9000", "invalid"] {
+            let (port, warning) = resolve_http_port(None, Some(value), Some("9001"), true);
+            assert_eq!(
+                port, None,
+                "env value {value:?} must not enable HTTP on a stdio spawn"
+            );
+            let warning = warning.expect("ignoring the env must be reported, not silent");
+            assert!(
+                warning.contains("spawned by a client on stdio") && warning.contains("--http"),
+                "warning should name the cause and the fix, got: {warning}"
+            );
+        }
+
+        // The desktop app's own bridge passes --http explicitly and is unaffected,
+        // even though it is itself spawned with piped stdio.
+        assert_eq!(
+            resolve_http_port(Some(8765), Some("1"), None, true),
+            (Some(8765), None)
+        );
+
+        // No HTTP configuration at all stays a silent stdio start - a client spawn is
+        // the normal case and must not warn.
+        assert_eq!(resolve_http_port(None, None, None, true), (None, None));
+        assert_eq!(resolve_http_port(None, Some(""), None, true), (None, None));
     }
 
     #[test]

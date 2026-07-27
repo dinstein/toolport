@@ -743,6 +743,10 @@ mod file {
     }
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+        // Cross-process lock around load-modify-save so concurrent writers cannot
+        // drop each other's keys (SOU-332). Same sibling-lock pattern as the registry.
+        let path = path()?;
+        let _lock = crate::registry::lock_at(&path)?;
         let mut store = load()?;
         store.insert(account(server_id, key), value.to_string());
         save(&store)
@@ -753,6 +757,8 @@ mod file {
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+        let path = path()?;
+        let _lock = crate::registry::lock_at(&path)?;
         let mut store = load()?;
         if store.remove(&account(server_id, key)).is_some() {
             save(&store)?;
@@ -1160,6 +1166,62 @@ mod tests {
         let mut wrong = key;
         wrong[0] ^= 0xff;
         assert!(file::open(&wrong, &sealed).is_err());
+    }
+
+    /// SOU-332: concurrent file-backend writers must not drop each other's keys.
+    /// Without the load-modify-save lock, last atomic_write wins and loses peers.
+    #[test]
+    fn file_backend_concurrent_sets_preserve_all_keys() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _data_dir = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sou332-secrets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _dir_override = crate::registry::DataDirOverride::set(&dir);
+
+        let prev_key = std::env::var("CONDUIT_SECRET_KEY").ok();
+        let prev_toolport = std::env::var("TOOLPORT_SECRET_KEY").ok();
+        std::env::remove_var("TOOLPORT_SECRET_KEY");
+        std::env::set_var("CONDUIT_SECRET_KEY", "sou-332-unit-test-passphrase");
+        assert!(file::active());
+
+        const THREADS: usize = 8;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let key = format!("KEY_{i}");
+                    set_secret("srv", &key, &format!("val-{i}")).expect("set_secret");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for i in 0..THREADS {
+            let key = format!("KEY_{i}");
+            assert_eq!(
+                get_secret("srv", &key).as_deref(),
+                Some(format!("val-{i}").as_str()),
+                "key {key} must survive concurrent writers"
+            );
+        }
+
+        match prev_key {
+            Some(v) => std::env::set_var("CONDUIT_SECRET_KEY", v),
+            None => std::env::remove_var("CONDUIT_SECRET_KEY"),
+        }
+        match prev_toolport {
+            Some(v) => std::env::set_var("TOOLPORT_SECRET_KEY", v),
+            None => std::env::remove_var("TOOLPORT_SECRET_KEY"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The data-protection keychain round-trips a per-server secret: write via

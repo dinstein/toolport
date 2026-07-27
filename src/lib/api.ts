@@ -361,6 +361,16 @@ export function httpBridgeStatus(): Promise<HttpBridgeStatus> {
 }
 
 /**
+ * Stop obsolete Toolport gateway processes (older versions / stale paths).
+ * Keeps the current resolved binary and the supervised HTTP bridge when they
+ * match. Clients that auto-respawn MCP pick up the current binary on the next
+ * tool call. Returns human-readable labels of processes that were stopped.
+ */
+export function stopStaleGateways(): Promise<string[]> {
+  return invoke<string[]>("stop_stale_gateways");
+}
+
+/**
  * Result of {@link teamConnect} / {@link teamJoinPoll}. `status` is:
  * - `connected` — joined; `registry` is the fresh merged state.
  * - `pending` — the link requires admin approval; poll `requestToken` via {@link teamJoinPoll}.
@@ -467,14 +477,20 @@ export function detectClients(): Promise<DetectedClient[]> {
 }
 
 /** Install the Toolport gateway into a client's config, optionally scoped to a
- * profile (by name). Omit profile to expose all enabled servers. */
+ * profile (by name). Omit profile to expose all enabled servers.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406).
+ * `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407). */
 export function installGateway(
   clientId: string,
   profile?: string,
+  force?: boolean,
+  transport?: "stdio" | "sharedHttp",
 ): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("install_gateway", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
+    transport: transport ?? "stdio",
   });
 }
 
@@ -484,14 +500,17 @@ export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
 }
 
 /** Import a client's servers into Toolport, then leave the client with only the
- * Toolport gateway (optionally scoped to a profile). Backs up the config first. */
+ * Toolport gateway (optionally scoped to a profile). Backs up the config first.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406). */
 export function migrateClient(
   clientId: string,
   profile?: string,
+  force?: boolean,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
   });
 }
 

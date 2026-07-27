@@ -292,6 +292,7 @@ headless and Docker configs do not break on upgrade.
 | `TOOLPORT_CLIENT_ID`             | Identifies the client to the gateway for live profile resolution.                                   | None             | Clients                   |
 | `TOOLPORT_DATA_DIR`              | Override the full path to the Toolport config directory.                                            | OS config root   | Everywhere                |
 | `TOOLPORT_DEBUG`                 | Enable trace and debug logging.                                                                     | None             | Everywhere                |
+| `TOOLPORT_CODE_MODE`             | Force-enable code mode (`toolport_run_script`) even if Settings/registry has it off.                | Off (force)      | Gateway                   |
 | `TOOLPORT_DISCOVERY`             | Override discovery mode (`lazy`, `grouped`, `full`).                                                | Registry setting | Everywhere                |
 | `TOOLPORT_EMBED_BLEND`           | Semantic search embedding blend weight (float).                                                     | Registry setting | Gateway / semantic search |
 | `TOOLPORT_EMBED_ENDPOINT`        | Semantic search embedding endpoint URL.                                                             | Registry setting | Gateway / semantic search |
@@ -317,4 +318,9 @@ headless and Docker configs do not break on upgrade.
 - **Client config writers** (Cursor/Claude local JSON) still need the desktop
   app or a one-time manual URL in the client config — which is what sandboxed
   setups usually want anyway.
+- **Code mode** (`toolport_run_script`) is **on by default** in the registry
+  (Settings kill switch / `"codeMode": false`). It is not a security boundary:
+  agents supply JS that can call many tools in one round-trip; each call still
+  hits the same scope and approval gates. Shared multi-tenant gateways that do
+  not want the surface should set `"codeMode": false` in the registry.
 - Open WebUI details: [openwebui.md](./openwebui.md).

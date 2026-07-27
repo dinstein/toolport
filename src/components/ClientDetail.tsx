@@ -93,8 +93,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
   // "" = follow the active profile; else scope to one.
   const [profile, setProfile] = useState("");
+  // stdio (spawn per client) or sharedHttp (one bridge, SOU-407).
+  const [transport, setTransport] = useState<"stdio" | "sharedHttp">("stdio");
   const [migrateOpen, setMigrateOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
   const installed = client.gatewayInstalled;
+  const customized = client.entryState === "customized";
+  const managedTransport =
+    registry?.clientManagedEntries?.[client.id]?.transport === "sharedHttp"
+      ? "sharedHttp"
+      : "stdio";
   // Whether the client app is actually on this machine. We allow Disconnect even
   // when absent (to clean up a stale entry), but block a fresh Connect, writing a
   // config into a client that isn't installed just creates a file nothing reads.
@@ -106,6 +114,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   useEffect(() => {
     setProfile(currentScope);
   }, [currentScope, client.id]);
+  useEffect(() => {
+    setTransport(managedTransport);
+  }, [managedTransport, client.id]);
 
   // Discovery: the global mode this client falls back to, and its own override (if any).
   // The gateway resolves env > per-client > global, so an override here applies live.
@@ -166,6 +177,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
    * entry's TOOLPORT_PROFILE in place, no disconnect needed). */
   async function applyScope() {
+    if (customized) {
+      // Must not silently overwrite a hand-edited entry (SOU-406).
+      setResetOpen(true);
+      return;
+    }
     setBusy(true);
     try {
       await installGateway(client.id, profile || undefined);
@@ -184,6 +200,25 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       setBusy(false);
     }
   }
+
+  /** Overwrite a customized entry with the default gateway (after confirm). */
+  async function resetToDefault() {
+    setBusy(true);
+    try {
+      await installGateway(client.id, profile || undefined, true, transport);
+      toast.success(`Reset ${client.name} to the default Toolport gateway`, {
+        description: clientRestartHint(client.name, client.id),
+      });
+      setResetOpen(false);
+      onChanged();
+    } catch (e) {
+      toastError(`${e}`);
+      // Rethrow so ConfirmDialog stays open for retry (SOU-406 / CodeRabbit).
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
   // Servers configured directly in the client (not the gateway) that migrate
   // would move into Toolport and strip from the client's config.
   const movable = client.servers.filter((s) => !isGatewayDetected(s));
@@ -191,7 +226,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function migrate() {
     setBusy(true);
     try {
-      const result = await migrateClient(client.id, profile || undefined);
+      // Migrate rewrites the whole gateway slot; force only after the user confirmed
+      // the migrate dialog when the entry is customized (SOU-406).
+      const result = await migrateClient(
+        client.id,
+        profile || undefined,
+        customized || undefined,
+      );
       onRegistryChange(result.registry);
       toast.success(
         `Moved ${result.moved.length} server${result.moved.length === 1 ? "" : "s"} into Toolport`,
@@ -309,13 +350,21 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         await uninstallGateway(client.id);
         toast.success(`Disconnected Toolport from ${client.name}`);
       } else {
-        const outcome = await installGateway(client.id, profile || undefined);
+        const outcome = await installGateway(
+          client.id,
+          profile || undefined,
+          false,
+          transport,
+        );
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
           description: connectSuccessDescription(
             client.name,
             [
+              transport === "sharedHttp"
+                ? "Uses the shared HTTP bridge (one gateway process)."
+                : null,
               profile ? `Scoped to the "${profile}" profile.` : null,
               !profile && outcome.backup ? "Previous config backed up." : null,
             ],
@@ -336,7 +385,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       {/* Connection: the one thing that actually matters in a client. */}
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          {installed ? (
+          {customized ? (
+            <span className="mb-1 inline-flex items-center gap-1 rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs font-medium text-warning">
+              <TriangleAlert className="size-3" />
+              custom configuration
+            </span>
+          ) : installed ? (
             <span className="mb-1 inline-flex items-center gap-1 rounded-full border border-success/30 bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
               <Link2 className="size-3" />
               connected to Toolport
@@ -358,7 +412,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               {toolportStudioClientBlurb()}
             </p>
           )}
-          {installed && (
+          {customized && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Custom configuration - not managed by Toolport. Hand-edited gateway entry is
+              left as-is until you reset it.
+            </p>
+          )}
+          {installed && !customized && (
             <p className="mt-1 text-xs text-muted-foreground">
               Sees{" "}
               <span className="font-medium text-foreground">
@@ -366,6 +426,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </span>{" "}
               · {scopeServerCount(currentScope)} server
               {scopeServerCount(currentScope) === 1 ? "" : "s"}
+              {managedTransport === "sharedHttp" ? " · shared HTTP" : ""}
             </p>
           )}
           {!present && !installed && (
@@ -376,7 +437,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {profiles.length > 1 && (
+          {!installed && present && (
+            <Select
+              value={transport}
+              onValueChange={(v) =>
+                setTransport(v === "sharedHttp" ? "sharedHttp" : "stdio")
+              }
+            >
+              <SelectTrigger size="sm" className="w-44">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="stdio">Spawn (stdio)</SelectItem>
+                <SelectItem value="sharedHttp">Shared HTTP</SelectItem>
+              </SelectContent>
+            </Select>
+          )}
+          {profiles.length > 1 && !customized && (
             <Select
               value={profile || "__all__"}
               onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
@@ -394,11 +471,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </SelectContent>
             </Select>
           )}
-          {installed && profile !== currentScope && (
+          {installed && !customized && profile !== currentScope && (
             <Button size="sm" onClick={applyScope} disabled={busy}>
               <Check className="size-4" />
               Apply scope
             </Button>
+          )}
+          {customized && (
+            <ConfirmDialog
+              open={resetOpen}
+              onOpenChange={setResetOpen}
+              trigger={
+                <Button size="sm" variant="default" disabled={busy}>
+                  <Check className="size-4" />
+                  Reset to default
+                </Button>
+              }
+              title={`Reset ${client.name} to the default Toolport gateway?`}
+              description="This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone."
+              confirmLabel="Reset to default"
+              onConfirm={resetToDefault}
+            />
           )}
           {installed ? (
             <ConfirmDialog
@@ -409,7 +502,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 </Button>
               }
               title={`Disconnect Toolport from ${client.name}?`}
-              description="This rewrites the client's MCP config to remove the gateway. You can reconnect anytime."
+              description={
+                customized
+                  ? "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime."
+                  : "This rewrites the client's MCP config to remove the gateway. You can reconnect anytime."
+              }
               confirmLabel="Disconnect"
               destructive
               onConfirm={toggleInstall}
@@ -441,7 +538,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         </div>
       )}
 
-      {installed && (
+      {installed && !customized && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
           <div className="min-w-0">
             <div className="text-xs font-medium text-foreground">
@@ -484,7 +581,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         </div>
       )}
 
-      {installed ? (
+      {installed && !customized ? (
         <div>
           <div className="mb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
             Servers it can reach
@@ -506,7 +603,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </div>
           )}
         </div>
-      ) : scopeServerCount(profile) > 0 ? (
+      ) : !customized && scopeServerCount(profile) > 0 ? (
         <div className="flex flex-col gap-4">
           <p className="max-w-prose text-sm text-muted-foreground">
             Connect {client.name} once and it reaches your{" "}
@@ -522,13 +619,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             servers={scopeServers(profile).map((s) => s.name)}
           />
         </div>
-      ) : (
+      ) : !customized ? (
         <p className="max-w-prose text-sm text-muted-foreground">
           Connect {client.name}, then enable servers under{" "}
           <span className="font-medium text-foreground">All servers</span> and
           they&apos;ll all route through Toolport, no per-client setup.
         </p>
-      )}
+      ) : null}
 
       {client.usesConnectors && (
         <Card className="gap-0 border-info/20 bg-info/5">
@@ -663,6 +760,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               backed-up config. After migrating, re-enter them under each server's secrets
               so the gateway can connect.
             </p>
+            {customized && (
+              <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
+                This client has a custom Toolport entry. Migrating replaces it with the
+                default gateway command.
+              </p>
+            )}
             <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
               {movable.map((s) => s.name).join(", ")}
             </div>

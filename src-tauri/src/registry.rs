@@ -8,7 +8,7 @@
 //! Secrets are never stored here. Env vars marked `secret` keep their value in
 //! the OS keychain; this file only records that a secret exists.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -338,12 +338,15 @@ pub struct Registry {
     /// browse per-server instead of searching - instead of setting a per-client env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_mode: Option<String>,
-    /// Opt-in server-side "code mode": advertise the `toolport_run_script` meta-tool so an
+    /// Server-side "code mode": advertise the `toolport_run_script` meta-tool so an
     /// agent can orchestrate many downstream tool calls in one sandboxed JS script (a single
-    /// round-trip). Off by default, since agent-supplied server-side JS is a powerful surface.
-    /// The gateway reads this from the registry, so it applies to every client; an explicit
-    /// `CONDUIT_CODE_MODE=1` still force-enables regardless.
-    #[serde(default)]
+    /// round-trip). **On by default** (SOU-397): each in-script call still hits the same
+    /// scope / approval gates as `toolport_call_tool`, and Settings is the kill switch.
+    /// Code mode is not a security boundary (agent-supplied JS). Shared/HTTP multi-tenant
+    /// operators who do not want the surface can turn it off in Settings or set
+    /// `"codeMode": false` in the registry. `TOOLPORT_CODE_MODE=1` (legacy
+    /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
+    #[serde(default = "default_true")]
     pub code_mode: bool,
     /// Opt-in agent control: when true, an agent may turn servers on or off via
     /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
@@ -420,6 +423,12 @@ pub struct Registry {
     /// reinstalling the client (same mechanism as `client_scopes`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub client_discovery: HashMap<String, String>,
+    /// What Toolport last wrote into each client's config as its gateway entry
+    /// (command/args/env), keyed by client id. Used to distinguish a managed install
+    /// from a hand-edited entry under the same name (SOU-406 / #487). Absent = pre-
+    /// ownership install; fall back to the command-basename heuristic.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub client_managed_entries: HashMap<String, ManagedEntry>,
     /// Consumers registered to reach the gateway over the HTTP/OpenAPI bridge,
     /// each with its own hashed bearer token and scope. Empty = the bridge uses
     /// only the legacy single `CONDUIT_HTTP_TOKEN` (back-compat).
@@ -438,6 +447,101 @@ pub struct Registry {
     /// pass-through-safe.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Snapshot of the gateway entry Toolport last wrote into a client config (SOU-406).
+/// Compared against the live entry on detect so a deliberate hand-edit is not treated
+/// as a stale install. Bearer tokens are never stored here (stripped from env/args).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Env key→value pairs we wrote (non-secret only: client id / profile).
+    /// `BTreeMap` keeps serde order stable for equality checks. Authorization is stripped.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `"stdio"` (default) or `"sharedHttp"` (SOU-407).
+    #[serde(default = "managed_transport_stdio")]
+    pub transport: String,
+    /// Shared-HTTP MCP URL when `transport` is `sharedHttp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Unix epoch seconds when we last wrote this entry.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+fn managed_transport_stdio() -> String {
+    "stdio".into()
+}
+
+impl ManagedEntry {
+    /// Build a record from the [`ServerEntry`] we are about to (or just did) write.
+    /// Strips bearer tokens so the registry never holds HTTP credentials.
+    pub fn from_gateway_entry(entry: &ServerEntry) -> Self {
+        let env = entry
+            .env
+            .iter()
+            .filter(|e| !e.key.eq_ignore_ascii_case("authorization"))
+            .filter_map(|e| {
+                e.value
+                    .as_ref()
+                    .map(|v| (e.key.clone(), v.clone()))
+            })
+            .collect();
+        let args = strip_auth_header_args(&entry.args);
+        let is_bridge = entry
+            .command
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("npx"))
+            && entry.args.iter().any(|a| a == "mcp-remote");
+        let is_shared = entry.url.is_some() || is_bridge;
+        Self {
+            command: entry.command.clone().unwrap_or_default(),
+            args,
+            env,
+            transport: if is_shared {
+                "sharedHttp".into()
+            } else {
+                "stdio".into()
+            },
+            url: entry.url.clone().or_else(|| {
+                // Bridge form: URL is an mcp-remote arg.
+                entry
+                    .args
+                    .iter()
+                    .find(|a| a.starts_with("http://") || a.starts_with("https://"))
+                    .cloned()
+            }),
+            updated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Drop `--header` / `Authorization: …` pairs so ownership records stay non-secret.
+pub fn strip_auth_header_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--header" {
+            // Skip flag and its value (often `Authorization: Bearer …`).
+            i += 2;
+            continue;
+        }
+        if a.to_ascii_lowercase().starts_with("authorization:") {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
 }
 
 /// A joined Conduit Teams server. Holds only non-secret connection metadata; the
@@ -568,7 +672,7 @@ impl Default for Registry {
             quarantine_on_drift: false,
             lazy_discovery: true,
             discovery_mode: None,
-            code_mode: false,
+            code_mode: true,
             allow_agent_control: false,
             integrity_check: true,
             content_defense: true,
@@ -581,6 +685,7 @@ impl Default for Registry {
             client_scopes: HashMap::new(),
             folder_profiles: Vec::new(),
             client_discovery: HashMap::new(),
+            client_managed_entries: HashMap::new(),
             http_clients: Vec::new(),
             secrets_generation: 0,
             unknown_fields: serde_json::Map::new(),
@@ -1120,6 +1225,22 @@ impl Registry {
     /// This client's discovery-mode override, if any (`None` = inherit the global mode).
     pub fn client_discovery_mode(&self, client_id: &str) -> Option<&str> {
         self.client_discovery.get(client_id).map(String::as_str)
+    }
+
+    /// Record what we just wrote into a client's gateway entry (SOU-406).
+    pub fn set_client_managed_entry(&mut self, client_id: &str, entry: ManagedEntry) {
+        self.client_managed_entries
+            .insert(client_id.to_string(), entry);
+    }
+
+    /// Clear the ownership record (uninstall or explicit forget).
+    pub fn clear_client_managed_entry(&mut self, client_id: &str) {
+        self.client_managed_entries.remove(client_id);
+    }
+
+    /// What we last wrote for this client, if anything.
+    pub fn client_managed_entry(&self, client_id: &str) -> Option<&ManagedEntry> {
+        self.client_managed_entries.get(client_id)
     }
 
     /// Record that a client is *explicitly* unscoped: it follows the active
@@ -2186,6 +2307,26 @@ mod tests {
         r.set_client_scope("claude", Some("Work"));
         r.set_client_scope("claude", None);
         assert!(!r.client_scopes.contains_key("claude"));
+    }
+
+    #[test]
+    fn client_managed_entries_set_and_clear() {
+        let mut r = Registry::default();
+        assert!(r.client_managed_entry("claude-desktop").is_none());
+        let entry = ManagedEntry {
+            command: "/opt/toolport/toolport-gateway".into(),
+            args: vec![],
+            env: [("TOOLPORT_CLIENT_ID".into(), "claude-desktop".into())]
+                .into_iter()
+                .collect(),
+            transport: "stdio".into(),
+            url: None,
+            updated_at: 42,
+        };
+        r.set_client_managed_entry("claude-desktop", entry.clone());
+        assert_eq!(r.client_managed_entry("claude-desktop"), Some(&entry));
+        r.clear_client_managed_entry("claude-desktop");
+        assert!(r.client_managed_entry("claude-desktop").is_none());
     }
 
     #[test]
